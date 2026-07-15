@@ -1,0 +1,76 @@
+# =============================================================================
+# GitLab 自动跟随 GitHub 远程仓库
+# -----------------------------------------------------------------------------
+# 原理：定时流水线（schedule）或手动触发时，以 mirror 方式从 GitHub 克隆
+#       全部分支/标签，再镜像推送回本 GitLab 仓库，使 GitLab 内容与 GitHub
+#       完全一致（GitLab = GitHub 的镜像）。
+#
+# 触发方式：
+#   1. 调度（schedule）—— 由 GitLab 定时触发，见 UI > Build > Pipeline schedules
+#   2. 手动（web）       —— 在流水线页 Run pipeline 时手动启动
+#   普通的 push 不触发本任务，避免镜像回推造成自我循环。
+#
+# 所需 CI/CD 变量（Settings > CI/CD > Variables）：
+#   GITHUB_DEPLOY_KEY       GitHub 仓库只读 deploy key 的私钥（masked，多行）
+#                           或改用文件型变量 GITHUB_DEPLOY_KEY_FILE。
+#   GITLAB_TOKEN            （可选但推荐）具备 write_repository 权限的 Project
+#                           Access Token；用 --mirror 删除远端分支时必需。
+#                           留空则回退到 CI_JOB_TOKEN（可能无法删除分支）。
+#
+# 一次性准备（详见 docs/gitlab-mirror-setup.md）：
+#   1. 生成 SSH key，公钥加入 GitHub 仓库 deploy keys（只读）
+#   2. 私钥写入 GitLab CI 变量 GITHUB_DEPLOY_KEY
+#   3. 创建流水线调度（目标分支 = 含本文件的分支，通常为 main）
+#   4. 将 GitLab 默认分支改为 main
+# =============================================================================
+
+variables:
+  GIT_STRATEGY: none
+  # GitHub 仓库 SSH 地址（与 origin 对应）
+  GITHUB_SSH_URL: "git@github.com:Naoki326/awesomeweldoneskills.git"
+
+stages:
+  - mirror
+
+mirror-from-github:
+  stage: mirror
+  image: alpine:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'          # 允许手动触发
+  before_script:
+    - apk add --no-cache git openssh-client
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts
+    - eval "$(ssh-agent -s)"
+    - |
+      if [ -n "$GITHUB_DEPLOY_KEY_FILE" ]; then
+        chmod 600 "$GITHUB_DEPLOY_KEY_FILE"
+        ssh-add "$GITHUB_DEPLOY_KEY_FILE"
+      elif [ -n "$GITHUB_DEPLOY_KEY" ]; then
+        printf '%s\n' "$GITHUB_DEPLOY_KEY" | tr -d '\r' | ssh-add -
+      else
+        echo "❌ 缺少 GITHUB_DEPLOY_KEY / GITHUB_DEPLOY_KEY_FILE 变量" >&2
+        exit 1
+      fi
+    - git config --global user.email "gitlab-ci@roboticplus.com"
+    - git config --global user.name "GitLab CI Mirror"
+  script:
+    - echo "📡 从 GitHub 克隆镜像..."
+    - git clone --mirror "$GITHUB_SSH_URL" repo.git
+    - cd repo.git
+    - echo "🗂  GitHub 端分支：" && git for-each-ref --format='  %(refname:short)' refs/heads
+    # 构造推回 GitLab 的 URL：优先用 Project Access Token，否则回退 CI_JOB_TOKEN
+    - |
+      if [ -n "$GITLAB_TOKEN" ]; then
+        PUSH_URL="https://oauth2:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      else
+        PUSH_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      fi
+    - git remote add gitlab "$PUSH_URL"
+    - echo "🚀 镜像推送到 GitLab..."
+    # --mirror 会同步全部分支/标签，并在 GitLab 侧删除 GitHub 已不存在的引用。
+    # 若不想删除 GitLab 独有分支，改用：git push --force --all gitlab && git push --force --tags gitlab
+    - git push --mirror gitlab
+    - echo "✅ 同步完成，GitLab 已跟随 GitHub。"
+  # 即使后续 push 事件又触发流水线，本任务也只认 schedule/web，不会自我循环
